@@ -34,9 +34,17 @@ __FBSDID("$FreeBSD: src/usr.bin/bsdiff/bspatch/bspatch.c,v 1.1 2005/08/06 01:59:
 #include <string.h>
 #include <err.h>
 #include <errno.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
+
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#define _CRT_SECURE_NO_WARNINGS
+#define fseeko _fseeki64
+#define ftello _ftelli64
+#define off_t  __int64
+#endif
 
 static off_t offtin(u_char *buf)
 {
@@ -56,12 +64,11 @@ static off_t offtin(u_char *buf)
 	return y;
 }
 
-
-void writeFull(const char * name, int fd,
+void writeFull(const char * name, FILE * stream,
     const unsigned char * buf, size_t count)
 {
     while (count) {
-        ssize_t res = write(fd, (char *) buf, count);
+        size_t res = fwrite((const void *)buf, 1L, count, stream);
         if (res == -1) {
             if (errno == EINTR) continue;
             err(1,"writing to %s",name);
@@ -71,17 +78,31 @@ void writeFull(const char * name, int fd,
     }
 }
 
+int readFull(FILE * stream, const unsigned char * buf, size_t count)
+{
+	while (count) {
+		size_t res = fread((void *)buf, 1L, count, stream);
+
+		if (res == -1) return res;
+
+		count -= res;
+		buf += res;
+	}
+	return 0;
+}
+
 
 int main(int argc,char * argv[])
 {
 	FILE * f, * cpf, * dpf, * epf;
 	BZFILE * cpfbz2, * dpfbz2, * epfbz2;
 	int cbz2err, dbz2err, ebz2err;
+	FILE * stream;
 	int fd;
-	ssize_t oldsize,newsize;
-	ssize_t bzctrllen,bzdatalen;
+	off_t oldsize, newsize;
+	off_t bzctrllen, bzdatalen;
 	u_char header[32],buf[8];
-	u_char *old, *new;
+	u_char *oldBuffer, *newBuffer;
 	off_t oldpos,newpos;
 	off_t ctrl[3];
 	off_t lenread;
@@ -90,7 +111,7 @@ int main(int argc,char * argv[])
 	if(argc!=4) errx(1,"usage: %s oldfile newfile patchfile\n",argv[0]);
 
 	/* Open patch file */
-	if ((f = fopen(argv[3], "r")) == NULL)
+	if ((f = fopen(argv[3], "rb")) == NULL)
 		err(1, "fopen(%s)", argv[3]);
 
 	/*
@@ -150,16 +171,20 @@ int main(int argc,char * argv[])
 	if ((epfbz2 = BZ2_bzReadOpen(&ebz2err, epf, 0, 0, NULL, 0)) == NULL)
 		errx(1, "BZ2_bzReadOpen, bz2err = %d", ebz2err);
 
-	if(((fd=open(argv[1],O_RDONLY,0))<0) ||
-		((oldsize=lseek(fd,0,SEEK_END))==-1) ||
-		((old=malloc(oldsize+1))==NULL) ||
-		(lseek(fd,0,SEEK_SET)!=0) ||
-		(read(fd,old,oldsize)!=oldsize) ||
-		(close(fd)==-1)) err(1,"%s",argv[1]);
-	if((new=malloc(newsize+1))==NULL) err(1,NULL);
+	if (((stream = fopen(argv[1], "rb")) == NULL) ||
+		(fseeko(stream, 0LL, SEEK_END) != 0) ||
+		(oldsize = ftello(stream) < 0) ||
+		((oldBuffer = (u_char *)malloc((size_t)oldsize + 1)) == NULL) ||
+		(fseeko(stream, 0LL, SEEK_SET) != 0) ||
+		(readFull(stream, oldBuffer, (size_t)oldsize) < 0) || 
+		(fclose(stream) != 0)) 
+		err(1,"%s",argv[1]);
+
+	if((newBuffer = (u_char *)malloc((size_t)newsize + 1)) == NULL) 
+		err(1,NULL);
 
 	oldpos=0;newpos=0;
-	while(newpos<newsize) {
+	while (newpos < newsize) {
 		/* Read control data */
 		for(i=0;i<=2;i++) {
 			lenread = BZ2_bzRead(&cbz2err, cpfbz2, buf, 8);
@@ -170,11 +195,11 @@ int main(int argc,char * argv[])
 		};
 
 		/* Sanity-check */
-		if(newpos+ctrl[0]>newsize)
+		if (newpos + ctrl[0] > newsize)
 			errx(1,"Corrupt patch\n");
 
 		/* Read diff string */
-		lenread = BZ2_bzRead(&dbz2err, dpfbz2, new + newpos, ctrl[0]);
+		lenread = BZ2_bzRead(&dbz2err, dpfbz2, newBuffer + newpos, ctrl[0]);
 		if ((lenread < ctrl[0]) ||
 		    ((dbz2err != BZ_OK) && (dbz2err != BZ_STREAM_END)))
 			errx(1, "Corrupt patch\n");
@@ -182,7 +207,7 @@ int main(int argc,char * argv[])
 		/* Add old data to diff string */
 		for(i=0;i<ctrl[0];i++)
 			if((oldpos+i>=0) && (oldpos+i<oldsize))
-				new[newpos+i]+=old[oldpos+i];
+				newBuffer[newpos+i]+=oldBuffer[oldpos+i];
 
 		/* Adjust pointers */
 		newpos+=ctrl[0];
@@ -193,7 +218,7 @@ int main(int argc,char * argv[])
 			errx(1,"Corrupt patch\n");
 
 		/* Read extra string */
-		lenread = BZ2_bzRead(&ebz2err, epfbz2, new + newpos, ctrl[1]);
+		lenread = BZ2_bzRead(&ebz2err, epfbz2, newBuffer + newpos, ctrl[1]);
 		if ((lenread < ctrl[1]) ||
 		    ((ebz2err != BZ_OK) && (ebz2err != BZ_STREAM_END)))
 			errx(1, "Corrupt patch\n");
@@ -211,14 +236,16 @@ int main(int argc,char * argv[])
 		err(1, "fclose(%s)", argv[3]);
 
 	/* Write the new file */
-	if((fd=open(argv[2],O_CREAT|O_TRUNC|O_WRONLY,0666))<0)
-                err(1,"%s",argv[2]);
-        writeFull(argv[2], fd, new, newsize);
-        if(close(fd)==-1)
+	if ((stream = fopen(argv[2], "wb+")) == NULL)
 		err(1,"%s",argv[2]);
 
-	free(new);
-	free(old);
+	writeFull(argv[2], stream, newBuffer, newsize);
+
+	if (0 != fclose(stream))
+		err(1,"%s",argv[2]);
+
+	free(newBuffer);
+	free(oldBuffer);
 
 	return 0;
 }

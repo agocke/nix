@@ -36,9 +36,46 @@ __FBSDID("$FreeBSD: src/usr.bin/bsdiff/bsdiff/bsdiff.c,v 1.1 2005/08/06 01:59:05
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+
+// Unix vs Windows
+#ifndef _WIN32
 #include <unistd.h>
+#else
+#define _CRT_SECURE_NO_WARNINGS
+#define fseeko _fseeki64
+#define ftello _ftelli64
+#define off_t  __int64
+#endif
 
 #define MIN(x,y) (((x)<(y)) ? (x) : (y))
+
+void writeFull(const char * name, FILE * stream,
+    const unsigned char * buf, size_t count)
+{
+    while (count) {
+        size_t res = fwrite((const void *)buf, 1L, count, stream);
+        if (res == -1) {
+            if (errno == EINTR) continue;
+            err(1,"writing to %s",name);
+        }
+        count -= res;
+        buf += res;
+    }
+}
+
+int readFull(FILE * stream, const unsigned char * buf, size_t count)
+{
+	while (count) {
+		size_t res = fread((void *)buf, 1L, count, stream);
+
+		if (res == -1) return res;
+
+		count -= res;
+		buf += res;
+	}
+	return 0;
+}
 
 static void split(off_t *I,off_t *V,off_t start,off_t len,off_t h)
 {
@@ -195,7 +232,7 @@ static void offtout(off_t x,u_char *buf)
 
 int main(int argc,char *argv[])
 {
-	int fd;
+	FILE * stream;
 	u_char *old,*new;
 	off_t oldsize,newsize;
 	off_t *I,*V;
@@ -217,12 +254,14 @@ int main(int argc,char *argv[])
 
 	/* Allocate oldsize+1 bytes instead of oldsize bytes to ensure
 		that we never try to malloc(0) and get a NULL pointer */
-	if(((fd=open(argv[1],O_RDONLY,0))<0) ||
-		((oldsize=lseek(fd,0,SEEK_END))==-1) ||
-		((old=malloc(oldsize+1))==NULL) ||
-		(lseek(fd,0,SEEK_SET)!=0) ||
-		(read(fd,old,oldsize)!=oldsize) ||
-		(close(fd)==-1)) err(1,"%s",argv[1]);
+	if(((stream = fopen(argv[1], "rb")) == NULL) ||
+		(fseeko(stream, 0LL, SEEK_END) != 0) ||
+		(oldsize = ftello(stream) < 0) ||
+		((old = (u_char *)malloc((size_t)oldsize + 1)) == NULL) ||
+		(fseeko(stream, 0LL, SEEK_SET) != 0) ||
+		(readFull(stream, old, (size_t)oldsize) < 0) ||
+		(fclose(stream) != 0)) 
+		err(1,"%s",argv[1]);
 
 	if(((I=malloc((oldsize+1)*sizeof(off_t)))==NULL) ||
 		((V=malloc((oldsize+1)*sizeof(off_t)))==NULL)) err(1,NULL);
@@ -233,12 +272,14 @@ int main(int argc,char *argv[])
 
 	/* Allocate newsize+1 bytes instead of newsize bytes to ensure
 		that we never try to malloc(0) and get a NULL pointer */
-	if(((fd=open(argv[2],O_RDONLY,0))<0) ||
-		((newsize=lseek(fd,0,SEEK_END))==-1) ||
-		((new=malloc(newsize+1))==NULL) ||
-		(lseek(fd,0,SEEK_SET)!=0) ||
-		(read(fd,new,newsize)!=newsize) ||
-		(close(fd)==-1)) err(1,"%s",argv[2]);
+	if(((stream = fopen(argv[2], "rb")) == NULL) ||
+		(fseeko(stream, 0LL, SEEK_END) != 0) ||
+		(newsize = ftello(stream) < 0) ||
+		((new = (u_char *)malloc((size_t)newsize + 1)) == NULL) ||
+		(fseeko(stream, 0LL, SEEK_SET) != 0) ||
+		(readFull(stream, new, (size_t)newsize) < 0) ||
+		(fclose(stream) != 0)) 
+		err(1,"%s",argv[2]);
 
 	if(((db=malloc(newsize+1))==NULL) ||
 		((eb=malloc(newsize+1))==NULL)) err(1,NULL);
