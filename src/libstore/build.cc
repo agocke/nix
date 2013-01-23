@@ -7,7 +7,6 @@
 #include "local-store.hh"
 #include "util.hh"
 #include "archive.hh"
-#include "immutable.hh"
 
 #include <map>
 #include <sstream>
@@ -93,7 +92,7 @@ typedef map<Path, WeakGoalPtr> WeakGoalMap;
 class Goal : public boost::enable_shared_from_this<Goal>
 {
 public:
-    typedef enum {ecBusy, ecSuccess, ecFailed, ecNoSubstituters} ExitCode;
+    typedef enum {ecBusy, ecSuccess, ecFailed, ecNoSubstituters, ecIncompleteClosure} ExitCode;
 
 protected:
 
@@ -114,6 +113,10 @@ protected:
        failed because there are no substituters. */
     unsigned int nrNoSubstituters;
 
+    /* Number of substitution goals we are/were waiting for that
+       failed because othey had unsubstitutable references. */
+    unsigned int nrIncompleteClosure;
+
     /* Name of this goal for debugging purposes. */
     string name;
 
@@ -122,7 +125,7 @@ protected:
 
     Goal(Worker & worker) : worker(worker)
     {
-        nrFailed = nrNoSubstituters = 0;
+        nrFailed = nrNoSubstituters = nrIncompleteClosure = 0;
         exitCode = ecBusy;
     }
 
@@ -307,9 +310,11 @@ void Goal::waiteeDone(GoalPtr waitee, ExitCode result)
     trace(format("waitee `%1%' done; %2% left") %
         waitee->name % waitees.size());
 
-    if (result == ecFailed || result == ecNoSubstituters) ++nrFailed;
+    if (result == ecFailed || result == ecNoSubstituters || result == ecIncompleteClosure) ++nrFailed;
 
     if (result == ecNoSubstituters) ++nrNoSubstituters;
+
+    if (result == ecIncompleteClosure) ++nrIncompleteClosure;
 
     if (waitees.empty() || (result == ecFailed && !settings.keepGoing)) {
 
@@ -333,7 +338,7 @@ void Goal::amDone(ExitCode result)
 {
     trace("done");
     assert(exitCode == ecBusy);
-    assert(result == ecSuccess || result == ecFailed || result == ecNoSubstituters);
+    assert(result == ecSuccess || result == ecFailed || result == ecNoSubstituters || result == ecIncompleteClosure);
     exitCode = result;
     foreach (WeakGoals::iterator, i, waiters) {
         GoalPtr goal = i->lock();
@@ -757,6 +762,10 @@ private:
     /* Whether additional wanted outputs have been added. */
     bool needRestart;
 
+    /* Whether to retry substituting the outputs after building the
+       inputs. */
+    bool retrySubstitution;
+
     /* The derivation stored at drvPath. */
     Derivation drv;
 
@@ -813,7 +822,8 @@ private:
     GoalState state;
 
     /* Stuff we need to pass to initChild(). */
-    PathSet dirsInChroot;
+    typedef map<Path, Path> DirsInChroot; // maps target path to source path
+    DirsInChroot dirsInChroot;
     typedef map<string, string> Environment;
     Environment env;
 
@@ -905,6 +915,7 @@ DerivationGoal::DerivationGoal(const Path & drvPath, const StringSet & wantedOut
     : Goal(worker)
     , wantedOutputs(wantedOutputs)
     , needRestart(false)
+    , retrySubstitution(false)
     , fLogFile(0)
     , bzLogFile(0)
     , useChroot(false)
@@ -1061,10 +1072,15 @@ void DerivationGoal::outputsSubstituted()
 {
     trace("all outputs substituted (maybe)");
 
-    if (nrFailed > 0 && nrFailed > nrNoSubstituters && !settings.tryFallback)
+    if (nrFailed > 0 && nrFailed > nrNoSubstituters + nrIncompleteClosure && !settings.tryFallback)
         throw Error(format("some substitutes for the outputs of derivation `%1%' failed; try `--fallback'") % drvPath);
 
-    nrFailed = nrNoSubstituters = 0;
+    /*  If the substitutes form an incomplete closure, then we should
+        build the dependencies of this derivation, but after that, we
+        can still use the substitutes for this derivation itself. */
+    if (nrIncompleteClosure > 0 && !retrySubstitution) retrySubstitution = true;
+
+    nrFailed = nrNoSubstituters = nrIncompleteClosure = 0;
 
     if (needRestart) {
         needRestart = false;
@@ -1167,6 +1183,11 @@ void DerivationGoal::inputsRealised()
                 "%2% dependencies couldn't be built")
             % drvPath % nrFailed);
         amDone(ecFailed);
+        return;
+    }
+
+    if (retrySubstitution) {
+        haveDerivation();
         return;
     }
 
@@ -1361,10 +1382,8 @@ void replaceValidPath(const Path & storePath, const Path tmpPath)
        way first.  We'd better not be interrupted here, because if
        we're repairing (say) Glibc, we end up with a broken system. */
     Path oldPath = (format("%1%.old-%2%-%3%") % storePath % getpid() % rand()).str();
-    if (pathExists(storePath)) {
-        makeMutable(storePath);
+    if (pathExists(storePath))
         rename(storePath.c_str(), oldPath.c_str());
-    }
     if (rename(tmpPath.c_str(), storePath.c_str()) == -1)
         throw SysError(format("moving `%1%' to `%2%'") % tmpPath % storePath);
     if (pathExists(oldPath))
@@ -1863,8 +1882,14 @@ void DerivationGoal::startBuilder()
 
         /* Bind-mount a user-configurable set of directories from the
            host file system. */
-        dirsInChroot = settings.dirsInChroot;
-        dirsInChroot.insert(tmpDir);
+        foreach (StringSet::iterator, i, settings.dirsInChroot) {
+            size_t p = i->find('=');
+            if (p == string::npos)
+                dirsInChroot[*i] = *i;
+            else
+                dirsInChroot[string(*i, 0, p)] = string(*i, p + 1);
+        }
+        dirsInChroot[tmpDir] = tmpDir;
 
         /* Make the closure of the inputs available in the chroot,
            rather than the whole Nix store.  This prevents any access
@@ -1881,12 +1906,8 @@ void DerivationGoal::startBuilder()
             if (lstat(i->c_str(), &st))
                 throw SysError(format("getting attributes of path `%1%'") % *i);
             if (S_ISDIR(st.st_mode))
-                dirsInChroot.insert(*i);
+                dirsInChroot[*i] = *i;
             else {
-                /* Creating a hard link to *i is impossible if its
-                   immutable bit is set.  So clear it first. */
-                makeMutable(*i);
-
                 Path p = chrootRootDir + *i;
                 if (link(i->c_str(), p.c_str()) == -1) {
                     /* Hard-linking fails if we exceed the maximum
@@ -2056,9 +2077,9 @@ void DerivationGoal::initChild()
             /* Bind-mount all the directories from the "host"
                filesystem that we want in the chroot
                environment. */
-            foreach (PathSet::iterator, i, dirsInChroot) {
-                Path source = *i;
-                Path target = chrootRootDir + source;
+            foreach (DirsInChroot::iterator, i, dirsInChroot) {
+                Path source = i->second;
+                Path target = chrootRootDir + i->first;
                 if (source == "/proc") continue; // backwards compatibility
                 debug(format("bind mounting `%1%' to `%2%'") % source % target);
                 createDirs(target);
@@ -2322,13 +2343,15 @@ Path DerivationGoal::openLogFile()
 {
     if (!settings.keepLog) return "";
 
+    string baseName = baseNameOf(drvPath);
+
     /* Create a log file. */
-    Path dir = (format("%1%/%2%") % settings.nixLogDir % drvsLogDir).str();
+    Path dir = (format("%1%/%2%/%3%/") % settings.nixLogDir % drvsLogDir % string(baseName, 0, 2)).str();
     createDirs(dir);
 
     if (settings.compressLog) {
 
-        Path logFileName = (format("%1%/%2%.bz2") % dir % baseNameOf(drvPath)).str();
+        Path logFileName = (format("%1%/%2%.bz2") % dir % string(baseName, 2)).str();
         AutoCloseFD fd = open(logFileName.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
         if (fd == -1) throw SysError(format("creating log file `%1%'") % logFileName);
         closeOnExec(fd);
@@ -2343,7 +2366,7 @@ Path DerivationGoal::openLogFile()
         return logFileName;
 
     } else {
-        Path logFileName = (format("%1%/%2%") % dir % baseNameOf(drvPath)).str();
+        Path logFileName = (format("%1%/%2%") % dir % string(baseName, 2)).str();
         fdLogFile = open(logFileName.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
         if (fdLogFile == -1) throw SysError(format("creating log file `%1%'") % logFileName);
         closeOnExec(fdLogFile);
@@ -2632,7 +2655,7 @@ void SubstitutionGoal::referencesValid()
 
     if (nrFailed > 0) {
         debug(format("some references of path `%1%' could not be realised") % storePath);
-        amDone(ecFailed);
+        amDone(nrNoSubstituters > 0 || nrIncompleteClosure > 0 ? ecIncompleteClosure : ecFailed);
         return;
     }
 

@@ -8,6 +8,23 @@
 
 <!--==================================================================-->
 
+<section xml:id="ssec-relnotes-1.3"><title>Release 1.3 (January 4, 2013)</title>
+
+<para>This is primarily a bug fix release.  When this version is first
+run on Linux, it removes any immutable bits from the Nix store and
+increases the schema version of the Nix store.  (The previous release
+removed support for setting the immutable bit; this release clears any
+remaining immutable bits to make certain operations more
+efficient.)</para>
+
+<para>This release has contributions from Eelco Dolstra and Stuart
+Pernsteiner.</para>
+
+</section>
+
+
+<!--==================================================================-->
+
 <section xml:id="ssec-relnotes-1.2"><title>Release 1.2 (December 6, 2012)</title>
 
 <para>This release has the following improvements and changes:</para>

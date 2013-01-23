@@ -1,7 +1,6 @@
 #include "globals.hh"
 #include "misc.hh"
 #include "local-store.hh"
-#include "immutable.hh"
 
 #include <boost/shared_ptr.hpp>
 
@@ -446,6 +445,8 @@ void LocalStore::deletePathRecursive(GCState & state, const Path & path)
 
     printMsg(lvlInfo, format("deleting `%1%'") % path);
 
+    state.results.paths.insert(path);
+
     /* If the path is not a regular file or symlink, move it to the
        trash directory.  The move is to ensure that later (when we're
        not holding the global GC lock) we can delete the path without
@@ -456,7 +457,6 @@ void LocalStore::deletePathRecursive(GCState & state, const Path & path)
         // if the path was not valid, need to determine the actual
         // size.
         state.bytesInvalidated += size;
-        makeMutable(path.c_str());
         // Mac OS X cannot rename directories if they are read-only.
         if (chmod(path.c_str(), st.st_mode | S_IWUSR) == -1)
             throw SysError(format("making `%1%' writable") % path);
@@ -659,7 +659,10 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
        increase, since we hold locks on everything.  So everything
        that is not reachable from `roots'. */
 
-    if (state.shouldDelete) createDirs(state.trashDir);
+    if (state.shouldDelete) {
+        if (pathExists(state.trashDir)) deleteGarbage(state, state.trashDir);
+        createDirs(state.trashDir);
+    }
 
     /* Now either delete all garbage paths, or just the specified
        paths (for gcDeleteSpecific). */

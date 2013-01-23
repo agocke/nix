@@ -37,3 +37,12 @@ nix-store --option binary-caches "file://$cacheDir" -r $outPath
 nix-store --check-validity $outPath
 nix-store -qR $outPath | grep input-2
 
+
+# Test whether building works if the binary cache contains an
+# incomplete closure.
+clearStore
+
+rm $(grep -l "StorePath:.*dependencies-input-2" $cacheDir/*.narinfo)
+
+nix-build --option binary-caches "file://$cacheDir" dependencies.nix -o $TEST_ROOT/result 2>&1 | tee $TEST_ROOT/log
+grep -q "Downloading" $TEST_ROOT/log

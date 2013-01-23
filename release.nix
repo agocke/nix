@@ -89,9 +89,14 @@ let
           --with-dbd-sqlite=${perlPackages.DBDSQLite}/${perl.libPrefix}
           --with-www-curl=${perlPackages.WWWCurl}/${perl.libPrefix}
           --enable-gc
+          --sysconfdir=/etc
         '';
 
         enableParallelBuilding = true;
+
+        makeFlags = "profiledir=$(out)/etc/profile.d";
+
+        installFlags = "sysconfdir=$(out)/etc";
 
         doInstallCheck = true;
       };
